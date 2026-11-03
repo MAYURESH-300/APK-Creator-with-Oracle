@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<ScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Redeem Code"
+            android:textSize="28sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="24dp" />
+
+        <Button
+            android:id="@+id/createButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Create Test Redeem Code"
+            android:layout_marginBottom="20dp" />
+
+        <EditText
+            android:id="@+id/codeInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Enter redeem code"
+            android:inputType="textCapCharacters"
+            android:singleLine="true"
+            android:layout_marginBottom="12dp" />
+
+        <Button
+            android:id="@+id/redeemButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Redeem Code"
+            android:layout_marginBottom="24dp" />
+
+        <TextView
+            android:id="@+id/resultText"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Start the Firebase Emulator, then create a test code."
+            android:textSize="16sp" />
+
+    </LinearLayout>
+
+</ScrollView>

@@ -1,17 +1,22 @@
 package com.example.htmlandurlapkcreator
 
+import com.example.htmlandurlapkcreator.build.ArscCompiler
+import com.example.htmlandurlapkcreator.build.AxmlCompiler
 import org.junit.Test
-
 import org.junit.Assert.*
 
-/**
- * Example local unit test, which will execute on the development machine (host).
- *
- * See [testing documentation](http://d.android.com/tools/testing).
- */
 class ExampleUnitTest {
     @Test
-    fun addition_isCorrect() {
-        assertEquals(4, 2 + 2)
+    fun testArscCompiler() {
+        val bytes = ArscCompiler.compileResourceTable("MyTestApp")
+        assertNotNull(bytes)
+        assertTrue(bytes.size > 100)
+    }
+
+    @Test
+    fun testAxmlCompiler() {
+        val bytes = AxmlCompiler.compileManifest("com.test.app", "TestApp")
+        assertNotNull(bytes)
+        assertTrue(bytes.size > 100)
     }
 }
