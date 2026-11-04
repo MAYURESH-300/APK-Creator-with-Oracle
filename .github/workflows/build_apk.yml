@@ -16,9 +16,6 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Decode Project Zip
         run: |
           echo "${{ github.event.client_payload.projectZipBase64 }}" | base64 -d > project.zip
