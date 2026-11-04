@@ -1,0 +1,573 @@
+package com.example.ui.game
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.net.Uri
+import android.opengl.GLSurfaceView
+import android.provider.OpenableColumns
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Text
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.zIndex
+import kotlin.math.roundToInt
+import com.example.game.GameEngine
+import com.example.graphics.GLGameRenderer
+import com.example.teapot.ExitSpectatorDialog
+import com.example.teapot.TeapotBottomBar
+import com.example.teapot.TeapotObjectInfo
+import com.example.teapot.TeapotPlacementControls
+import com.example.teapot.TeapotTopBar
+import com.example.ui.components.*
+import kotlinx.coroutines.delay
+import kotlin.math.abs
+
+/**
+ * Main 3D Game Screen featuring:
+ * 1. Single Virtual Joystick fixed strictly at the bottom-left corner (1/4th screen).
+ * 2. Genshin Impact Serenitea Pot Placement System in Spectator Mode:
+ *    - Top Area Selector and compact top-right action icons (Rotate, Save, Import, Multi-select)
+ *    - The subcategory icon strip is omitted; category tabs stay visible.
+ *    - Bottom Furnishing Drawer: Hides smoothly when joystick moves camera, reappears when idle!
+ *    - 3D Model Swapping for world objects, platforms, NPCs, and character avatar!
+ *    - File Manager Import for .glb, .obj, .fbx models.
+ *    - Persistent saving that restores all swapped models on app reopen!
+ */
+@SuppressLint("ClickableViewAccessibility")
+@Composable
+fun GameScreen(
+    viewModel: GameViewModel,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val uiState by viewModel.uiState.collectAsState()
+
+    val gameEngine = remember { GameEngine() }
+    val glRenderer = remember { GLGameRenderer(context, gameEngine) }
+
+    // Drag cards and touch overlays report Compose-root coordinates; the OpenGL surface can
+    // have a different origin/size under edge-to-edge layouts. Convert them before raycasting.
+    var glViewOriginInRoot by remember { mutableStateOf(Offset.Zero) }
+    var glViewSize by remember { mutableStateOf(IntSize.Zero) }
+    var touchLayerOriginInRoot by remember { mutableStateOf(Offset.Zero) }
+
+    fun rootPointToGl(pointInRoot: Offset): Offset {
+        val width = glViewSize.width.toFloat()
+        val height = glViewSize.height.toFloat()
+        if (width <= 0f || height <= 0f) return pointInRoot
+        val localX = (pointInRoot.x - glViewOriginInRoot.x).coerceIn(0f, width)
+        val localY = (pointInRoot.y - glViewOriginInRoot.y).coerceIn(0f, height)
+        return Offset(
+            localX * glRenderer.screenWidth.toFloat() / width,
+            localY * glRenderer.screenHeight.toFloat() / height
+        )
+    }
+
+    fun touchLayerPointToGl(localPoint: Offset): Offset =
+        rootPointToGl(touchLayerOriginInRoot + localPoint)
+
+    // Android File Manager Picker for .glb, .obj, .fbx models (Requirement 3)
+    val modelPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val fileName = queryDisplayName(context, uri) ?: "imported_model.glb"
+            viewModel.importModelFile(uri, fileName)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        viewModel.initialize(context, gameEngine)
+    }
+
+    // Keep OpenGL renderer in sync with currently selected world target
+    LaunchedEffect(uiState.selectedTargetId) {
+        glRenderer.selectedTargetId = uiState.selectedTargetId
+    }
+
+    // Auto-dismiss save toast after 3 seconds
+    LaunchedEffect(uiState.saveToastMessage) {
+        if (uiState.saveToastMessage != null) {
+            delay(3000)
+            viewModel.clearSaveToast()
+        }
+    }
+
+    // Drag-and-drop state for placing 3D models over other objects
+    var draggingModelId by remember { mutableStateOf<String?>(null) }
+    var dragScreenPos by remember { mutableStateOf(Offset.Zero) }
+    var dragHoverTarget by remember { mutableStateOf<String?>(null) }
+
+    val density = LocalDensity.current.density
+
+    // Intercept back press in spectator mode to show exit spectator confirmation popup
+    BackHandler(enabled = uiState.isSpectatorMode) {
+        viewModel.requestExitSpectator()
+    }
+
+    Box(modifier = modifier.fillMaxSize()) {
+        // 1. OpenGL ES 3D Surface View (Background)
+        AndroidView(
+            factory = { ctx ->
+                GLSurfaceView(ctx).apply {
+                    setEGLContextClientVersion(2)
+                    setRenderer(glRenderer)
+                    renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+                }
+            },
+            modifier = Modifier
+                .fillMaxSize()
+                .onGloballyPositioned { coordinates ->
+                    glViewOriginInRoot = coordinates.positionInRoot()
+                    glViewSize = coordinates.size
+                }
+        )
+
+        // 2. Camera Touch Pan, Pinch-to-Zoom & Active Object Moving Layer
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .onGloballyPositioned { coordinates ->
+                    touchLayerOriginInRoot = coordinates.positionInRoot()
+                }
+                .pointerInput(uiState.isSpectatorMode, uiState.isEditingObject) {
+                    if (uiState.isSpectatorMode) {
+                        if (uiState.isEditingObject) {
+                            detectDragGestures(
+                                onDrag = { change, _ ->
+                                    change.consume()
+                                    val glPoint = touchLayerPointToGl(change.position)
+                                    viewModel.updateMovingActiveObject(glPoint.x, glPoint.y, glRenderer)
+                                }
+                            )
+                        } else {
+                            detectTapGestures(
+                                onTap = { offset ->
+                                    val glPoint = touchLayerPointToGl(offset)
+                                viewModel.selectObjectAtScreenPos(glPoint.x, glPoint.y, glRenderer)
+                                }
+                            )
+                        }
+                    }
+                }
+                .pointerInput(uiState.isSpectatorMode, uiState.isEditingObject) {
+                    if (!uiState.isEditingObject) {
+                        detectTransformGestures { _, pan, zoom, _ ->
+                            if (abs(zoom - 1.0f) > 0.005f) {
+                                viewModel.onZoomDelta((zoom - 1.0f) * 160f)
+                            }
+                            if (pan.x != 0f || pan.y != 0f) {
+                                viewModel.onCameraSwipe(pan.x, pan.y)
+                            }
+                        }
+                    }
+                }
+        )
+
+        // 2b. Genshin Impact Furnishing Info Overlay (Top-Left)
+        if (uiState.isSpectatorMode && uiState.isEditingObject) {
+            TeapotObjectInfo(
+                objectName = uiState.selectedTargetName,
+                description = uiState.activeObjectDescription,
+                height = uiState.activeObjectHeight,
+                modifier = Modifier.align(Alignment.TopStart)
+            )
+        }
+
+        // 3. TOP BARS (Standard Mode vs Genshin Teapot Spectator Mode)
+        if (uiState.isSpectatorMode) {
+            // GENSHIN IMPACT SERENITEA POT TOP BAR
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .windowInsetsPadding(WindowInsets.statusBars)
+            ) {
+                TeapotTopBar(
+                    areaName = uiState.teapotAreaName,
+                    onAreaPrevious = { viewModel.cycleTeapotArea(forward = false) },
+                    onAreaNext = { viewModel.cycleTeapotArea(forward = true) },
+                    onExitSpectator = { viewModel.requestExitSpectator() },
+                    onCameraSnapshot = { viewModel.snapCameraToNorth() },
+                    onRotateTarget = { viewModel.rotateSelectedTarget() },
+                    onSaveFurnishings = { viewModel.saveFurnishings() },
+                    onOpenImportPicker = {
+                        modelPickerLauncher.launch(arrayOf("model/*", "application/octet-stream", "*/*"))
+                    },
+                    onMultiSelectToggle = { viewModel.toggleMultiSelect() },
+                    isMultiSelect = uiState.isMultiSelect,
+                    typesCount = 4
+                )
+            }
+        } else {
+            // STANDARD TOP-LEFT SPECTATOR BUTTON
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .windowInsetsPadding(WindowInsets.statusBars)
+                    .padding(start = 14.dp, top = 12.dp)
+            ) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color(0x66000000))
+                        .border(1.5.dp, Color(0x88FFFFFF), RoundedCornerShape(14.dp))
+                        .clickable { viewModel.toggleSpectatorMode() }
+                        .padding(horizontal = 12.dp, vertical = 9.dp)
+                        .testTag("btn_spectator_mode")
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Videocam,
+                            contentDescription = "Toggle Spectator Mode",
+                            tint = Color.White,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "SPECTATOR",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+
+            // STANDARD TOP-CENTER COORDINATES HUD
+            if (uiState.settings.showCoordinates) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .windowInsetsPadding(WindowInsets.statusBars)
+                        .padding(top = 8.dp)
+                ) {
+                    CoordinatesHUD(
+                        playerCoords = uiState.playerCoords,
+                        nearestTargetInfo = uiState.nearestTargetInfo,
+                        score = uiState.score,
+                        hitCombo = uiState.hitCombo,
+                        playerHp = uiState.playerHp,
+                        modifier = Modifier.padding(horizontal = 4.dp)
+                    )
+                }
+            }
+
+            // STANDARD TOP-RIGHT COMPASS & SETTINGS
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .windowInsetsPadding(WindowInsets.statusBars)
+                    .padding(end = 14.dp, top = 12.dp)
+            ) {
+                CompassWidget(
+                    compassAngle = uiState.compassAngle,
+                    onClick = { viewModel.snapCameraToNorth() },
+                    modifier = Modifier.padding(end = 6.dp)
+                )
+
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .size(42.dp)
+                        .clip(CircleShape)
+                        .background(Color(0x55000000))
+                        .border(1.5.dp, Color(0x66FFFFFF), CircleShape)
+                        .testTag("btn_open_settings")
+                ) {
+                    IconButton(
+                        onClick = { viewModel.onOpenSettings() },
+                        modifier = Modifier.size(40.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Settings,
+                            contentDescription = "Open Settings",
+                            tint = Color.White,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        // 4. RIGHT-SIDE ACTIONS
+        // The four regular Teapot actions now live in the top bar. Keep the placement
+        // confirmation controls on the right only while an object is actively being edited.
+        if (uiState.isSpectatorMode && uiState.isEditingObject) {
+            TeapotPlacementControls(
+                isVerticalAdjustment = uiState.isVerticalAdjustment,
+                onCancel = { viewModel.cancelActivePlacement() },
+                onRotate = { viewModel.rotateActiveObject() },
+                onToggleAdjustmentMode = { viewModel.toggleAdjustmentMode() },
+                onConfirm = { viewModel.confirmActivePlacement() },
+                modifier = Modifier.align(Alignment.CenterEnd)
+            )
+        } else if (!uiState.isSpectatorMode) {
+            // Standard Zoom In / Out Controls
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 6.dp)
+            ) {
+                ZoomControls(
+                    onZoomIn = { viewModel.onZoomIn() },
+                    onZoomOut = { viewModel.onZoomOut() },
+                    currentZoom = uiState.currentZoom
+                )
+            }
+        }
+
+        // 5. BOTTOM COMPONENTS (Standard Action Controls vs Teapot Furnishing Drawer)
+        if (uiState.isSpectatorMode) {
+            // GENSHIN IMPACT SERENITEA POT BOTTOM DRAWER
+            // Drawer hides when an object is being placed/edited!
+            AnimatedVisibility(
+                visible = !uiState.isEditingObject,
+                enter = fadeIn() + slideInVertically { it },
+                exit = fadeOut() + slideOutVertically { it },
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .zIndex(10f)
+            ) {
+                TeapotBottomBar(
+                    selectedTargetId = uiState.selectedTargetId,
+                    selectedTargetName = uiState.selectedTargetName,
+                    availableTargets = viewModel.getAvailableTargets(),
+                    // Selecting a target must keep the drawer open; Move is a separate action.
+                    onSelectTarget = { viewModel.selectTarget(it) },
+                    onCycleTarget = { viewModel.cycleNextTarget() },
+                    // A tap swaps the selected target's visual mesh without replacing its game behavior.
+                    // Long-press + drag places a copy; PLACE COPY is a reliable non-drag fallback.
+                    onSwapModel = { viewModel.swapModelForSelectedTarget(it) },
+                    onPlaceModel = { viewModel.spawnAndEditModel(it, glRenderer) },
+                    onStartMoveSelected = { viewModel.startMovingSelectedObject() },
+                    isMovingSelected = uiState.isMovingObject,
+                    onOpenImportPicker = {
+                        // Open file picker supporting .glb, .obj, .fbx, and generic 3D models
+                        modelPickerLauncher.launch(
+                            arrayOf(
+                                "model/*",
+                                "application/octet-stream",
+                                "*/*"
+                            )
+                        )
+                    },
+                    onModelDragStart = { modelId, offset ->
+                        draggingModelId = modelId
+                        dragScreenPos = offset
+                        val glPoint = rootPointToGl(offset)
+                        viewModel.onModelDragHover(glPoint.x, glPoint.y, glRenderer, modelId)
+                    },
+                    onModelDrag = { dragAmount ->
+                        dragScreenPos += dragAmount
+                        val glPoint = rootPointToGl(dragScreenPos)
+                        viewModel.onModelDragHover(glPoint.x, glPoint.y, glRenderer, draggingModelId)
+                    },
+                    onModelDragEnd = {
+                        draggingModelId?.let { mId ->
+                            val glPoint = rootPointToGl(dragScreenPos)
+                            viewModel.onModelDragEnd(glPoint.x, glPoint.y, mId, glRenderer)
+                        }
+                        draggingModelId = null
+                    },
+                    onModelDragCancel = {
+                        viewModel.onModelDragCancel(glRenderer)
+                        draggingModelId = null
+                    },
+                    isJoystickActive = uiState.isJoystickActive
+                )
+            }
+        } else {
+            // STANDARD ACTION CONTROLS (Jump, Attack, Dash)
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .windowInsetsPadding(WindowInsets.navigationBars)
+                    .padding(end = 12.dp, bottom = 10.dp)
+                    .zIndex(10f)
+            ) {
+                ActionControls(
+                    onJump = { viewModel.onJump() },
+                    onAttack = { viewModel.onAttack() },
+                    onDash = { viewModel.onDash() },
+                    modifier = Modifier.size(160.dp)
+                )
+            }
+        }
+
+        // 6. FLOATING 3D MODEL DRAG PREVIEW (Follows user's finger during long-press drag)
+        val currentDraggingId = draggingModelId
+        if (currentDraggingId != null) {
+            val draggedModel = remember(currentDraggingId) {
+                com.example.teapot.TeapotModelRegistry.getModel(currentDraggingId)
+            }
+            if (draggedModel != null) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .offset {
+                            IntOffset(
+                                (dragScreenPos.x - 38.dp.toPx()).roundToInt(),
+                                (dragScreenPos.y - 75.dp.toPx()).roundToInt()
+                            )
+                        }
+                        .size(76.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(Color(0xD0004D40))
+                        .border(2.dp, Color(0xFF00E5FF), RoundedCornerShape(14.dp))
+                        .zIndex(200f)
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        Text(
+                            text = if (draggedModel.isUserImported) "📦" else when (draggedModel.category) {
+                                "Landform" -> "⛰️"
+                                "Building" -> "🏛️"
+                                "Companion" -> "🤖"
+                                else -> "✨"
+                            },
+                            fontSize = 26.sp
+                        )
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            text = draggedModel.name,
+                            color = Color.White,
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
+        }
+
+        // 7. BOTTOM-LEFT: Single Virtual Joystick (Highest Z-index 100f so it is never obstructed)
+        // Moves character in standard mode; moves spectator camera with zoom-dependent speed in spectator mode
+        Box(
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .padding(start = 16.dp, bottom = 14.dp)
+                .zIndex(100f)
+        ) {
+            VirtualJoystick(
+                onMove = { dx, dy -> viewModel.onJoystickMoved(dx, dy) },
+                sizeDp = 130
+            )
+        }
+
+        // 7. GOLDEN SAVE NOTIFICATION BANNER (Genshin Style)
+        AnimatedVisibility(
+            visible = uiState.saveToastMessage != null,
+            enter = fadeIn() + slideInVertically { -it },
+            exit = fadeOut() + slideOutVertically { -it },
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = 70.dp)
+        ) {
+            Box(
+                contentAlignment = Alignment.Center,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(Color(0xEE1B2421))
+                    .border(1.5.dp, Color(0xFFFFD54F), RoundedCornerShape(20.dp))
+                    .padding(horizontal = 20.dp, vertical = 10.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Default.CheckCircle,
+                        contentDescription = null,
+                        tint = Color(0xFF00E676),
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = uiState.saveToastMessage ?: "",
+                        color = Color(0xFFFFD54F),
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+
+        // 8. Settings Dialog
+        if (uiState.isSettingsOpen) {
+            SettingsDialog(
+                settings = uiState.settings,
+                onUpdateSettings = { viewModel.updateSettings(it) },
+                onResetPlayer = { viewModel.onResetPlayer() },
+                onResetWorld = { viewModel.onResetWorld() },
+                onDismiss = { viewModel.onCloseSettings() }
+            )
+        }
+
+        // 9. EXIT SPECTATOR CONFIRMATION POPUP PANEL (Requirement 3: save, cancel, discard buttons when user presses X)
+        if (uiState.showExitConfirmationDialog) {
+            ExitSpectatorDialog(
+                onSaveAndExit = { viewModel.saveAndExitSpectator() },
+                onDiscardAndExit = { viewModel.discardAndExitSpectator() },
+                onCancel = { viewModel.dismissExitSpectatorDialog() }
+            )
+        }
+    }
+}
+
+/**
+ * Safe helper to query the real filename from a Content Uri.
+ */
+private fun queryDisplayName(context: Context, uri: Uri): String? {
+    if (uri.scheme == "content") {
+        try {
+            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0) return cursor.getString(idx)
+                }
+            }
+        } catch (_: Exception) {}
+    }
+    return uri.path?.substringAfterLast('/')
+}

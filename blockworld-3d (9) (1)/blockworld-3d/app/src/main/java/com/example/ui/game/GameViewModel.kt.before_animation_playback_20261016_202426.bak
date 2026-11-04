@@ -1,0 +1,983 @@
+package com.example.ui.game
+
+import android.content.Context
+import android.net.Uri
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.example.game.*
+import com.example.model.Vector3
+import com.example.teapot.ModelSwapManager
+import com.example.teapot.TeapotModelRegistry
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+
+data class PendingPlacementState(
+    val objectId: String,
+    val objectName: String,
+    val originalPosition: Vector3,
+    val currentPosition: Vector3,
+    val isNewlyAdded: Boolean = false,
+    val modelId: String? = null
+)
+
+data class GameUIState(
+    val playerCoords: Vector3 = Vector3(0f, 1.5f, 0f),
+    val nearestTargetInfo: String? = null,
+    val nearestTargetDistance: Float = 0f,
+    val playerHp: Float = 100f,
+    val playerMaxHp: Float = 100f,
+    val score: Int = 0,
+    val hitCombo: Int = 0,
+    val dashCooldownPercent: Float = 0f,
+    val compassAngle: Float = 0f,
+    val currentZoom: Float = 8.5f,
+    val isSettingsOpen: Boolean = false,
+    val isSpectatorMode: Boolean = false,
+    val settings: GameSettings = GameSettings(),
+    val isHdrSkyAvailable: Boolean = true,
+    // Genshin Impact Teapot Placement System State
+    val isJoystickActive: Boolean = false,
+    val selectedTargetId: String = "platform_spawn",
+    val selectedTargetName: String = "Spawn Platform",
+    val teapotAreaName: String = "Nodoka Terrace",
+    val isMultiSelect: Boolean = false,
+    val saveToastMessage: String? = null,
+    val lastSwapTimestamp: Long = 0L,
+    // Move / Drag & Placement Confirmation State (Requirement 1 & 2)
+    val pendingPlacement: PendingPlacementState? = null,
+    val isMovingObject: Boolean = false,
+    val isEditingObject: Boolean = false,
+    val isVerticalAdjustment: Boolean = false,
+    val activeObjectHeight: Float = 14.0f,
+    val activeObjectRotation: Float = 0f,
+    val activeObjectDescription: String = "Can be placed side by side and can be stacked vertically.",
+    // Exit Spectator Confirmation Dialog State (Requirement 3)
+    val showExitConfirmationDialog: Boolean = false,
+    // Animation settings shown in the compact upper-left control.
+    val animationMenuExpanded: Boolean = false,
+    val availableAnimations: List<String> = emptyList(),
+    val activeAnimationName: String? = null,
+    val animationEnabled: Boolean = false,
+    val autoAnimationEnabled: Boolean = false,
+    val supportsSkeletalAnimation: Boolean = false
+)
+
+class GameViewModel : ViewModel() {
+
+    lateinit var engine: GameEngine
+        private set
+
+    private val _uiState = MutableStateFlow(GameUIState())
+    val uiState: StateFlow<GameUIState> = _uiState.asStateFlow()
+
+    private var appContext: Context? = null
+    private var vibrator: Vibrator? = null
+    private var lastHapticTimestamp = 0L
+
+    private val teapotAreas = listOf("Nodoka Terrace", "Floating Isle", "Emerald Peak", "Kasumi Court")
+    private var currentAreaIndex = 0
+
+    fun initialize(context: Context, gameEngine: GameEngine) {
+        appContext = context.applicationContext
+        engine = gameEngine
+
+        // Load persisted settings from SharedPreferences
+        val savedSettings = GameSettingsStorage.loadSettings(context)
+        engine.settings = savedSettings
+        _uiState.value = _uiState.value.copy(settings = savedSettings)
+
+        // Parse previously imported models off the UI thread. Detailed meshes and textures can be
+        // large; doing this inside initialize() previously froze the game or risked an ANR.
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    TeapotModelRegistry.initialize(context.applicationContext)
+                }
+                // Restore engine/world state after parsing, on the ViewModel dispatcher.
+                ModelSwapManager.loadSwapsFromStorage(context.applicationContext, engine.worldManager)
+                if (!ModelSwapManager.isSwapped("player_character") &&
+                    TeapotModelRegistry.getModel("prebuilt_cube_character") != null
+                ) {
+                    ModelSwapManager.applySwap("player_character", "prebuilt_cube_character", engine.worldManager)
+                    ModelSwapManager.saveSwapsToStorage(context.applicationContext)
+                }
+                _uiState.value = _uiState.value.copy(lastSwapTimestamp = System.currentTimeMillis())
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    saveToastMessage = "Some saved 3D models could not be loaded: ${e.message ?: "unknown error"}"
+                )
+            }
+        }
+
+        try {
+            vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        } catch (_: Exception) {}
+
+        // Configure callbacks with safe throttling
+        engine.onHitTarget = { _, _, isCrit ->
+            triggerHapticThrottled(if (isCrit) 50 else 30, minIntervalMs = 70)
+        }
+        engine.onObjectDestroyed = {
+            triggerHapticThrottled(80, minIntervalMs = 100)
+        }
+        engine.onJump = {
+            triggerHapticThrottled(20, minIntervalMs = 80)
+        }
+        engine.onDash = {
+            triggerHapticThrottled(40, minIntervalMs = 120)
+        }
+        engine.onBouncePad = {
+            triggerHapticThrottled(75, minIntervalMs = 150)
+        }
+
+        // Lightweight UI sync loop
+        viewModelScope.launch {
+            while (true) {
+                try {
+                    syncUIState()
+                } catch (_: Exception) {}
+                delay(50)
+            }
+        }
+    }
+
+    private fun syncUIState() {
+        val player = engine.player
+        val nearest = engine.worldManager.findNearestTarget(player.position)
+        val nearestText = nearest?.let {
+            val dist = player.position.distanceTo(it.position)
+            "${it.name} (${formatCoord(it.position.x)}, ${formatCoord(it.position.y)}, ${formatCoord(it.position.z)}) • ${String.format("%.1fm", dist)}"
+        }
+
+        val selectedMeshWithClips = ModelSwapManager.getSwappedMesh(_uiState.value.selectedTargetId)
+            ?.takeIf { it.animationNames.isNotEmpty() }
+        val animationMesh = selectedMeshWithClips ?: ModelSwapManager.getSwappedMesh("player_character")        _uiState.value = _uiState.value.copy(
+            playerCoords = player.position,
+            nearestTargetInfo = nearestText,
+            nearestTargetDistance = nearest?.let { player.position.distanceTo(it.position) } ?: 0f,
+            playerHp = player.health,
+            playerMaxHp = player.maxHealth,
+            score = engine.score,
+            hitCombo = engine.hitCombo,
+            dashCooldownPercent = 0f,
+            compassAngle = engine.camera.yaw,
+            currentZoom = engine.camera.distance,
+            isSpectatorMode = engine.camera.isSpectatorMode,
+            availableAnimations = animationMesh?.animationNames ?: emptyList(),
+            activeAnimationName = animationMesh?.activeAnimationName,
+            animationEnabled = animationMesh?.isAnimationEnabled == true,
+            autoAnimationEnabled = animationMesh?.isAutoAnimationEnabled == true,
+            supportsSkeletalAnimation = animationMesh?.supportsSkeletalAnimation == true,
+        )
+    }
+
+    private fun formatCoord(value: Float): String = String.format("%.1f", value)
+    private fun selectedAnimationMesh() =
+        ModelSwapManager.getSwappedMesh(_uiState.value.selectedTargetId)
+            ?.takeIf { it.animationNames.isNotEmpty() }
+            ?: ModelSwapManager.getSwappedMesh("player_character")
+
+    fun toggleAnimationMenu() {
+        _uiState.value = _uiState.value.copy(animationMenuExpanded = !_uiState.value.animationMenuExpanded)
+    }
+
+    fun closeAnimationMenu() {
+        _uiState.value = _uiState.value.copy(animationMenuExpanded = false)
+    }
+
+    fun setSelectedModelAnimationEnabled(enabled: Boolean) {
+        val mesh = selectedAnimationMesh()
+        if (mesh == null || mesh.animationNames.isEmpty()) {
+            _uiState.value = _uiState.value.copy(
+                saveToastMessage = "Import a GLB with skeletal animation clips, or select the animated player model."
+            )
+            return
+        }
+        mesh.setAnimationEnabled(enabled)
+        _uiState.value = _uiState.value.copy(
+            animationEnabled = mesh.isAnimationEnabled,
+            activeAnimationName = mesh.activeAnimationName,
+            saveToastMessage = if (enabled) "Animation enabled: ${mesh.activeAnimationName ?: "default clip"}" else "Animation paused on the current pose."
+        )
+    }
+
+    fun setSelectedModelAutoAnimation(enabled: Boolean) {
+        val mesh = selectedAnimationMesh()
+        if (mesh == null || mesh.animationNames.isEmpty()) {
+            _uiState.value = _uiState.value.copy(saveToastMessage = "The selected model has no animation clips.")
+            return
+        }
+        mesh.setAutoAnimation(enabled)
+        _uiState.value = _uiState.value.copy(
+            animationEnabled = mesh.isAnimationEnabled,
+            autoAnimationEnabled = mesh.isAutoAnimationEnabled,
+            activeAnimationName = mesh.activeAnimationName,
+            saveToastMessage = if (enabled) "Auto mode follows player joystick movement: Idle / Walk / Run." else "Manual animation selection enabled."
+        )
+    }
+
+    fun selectSelectedModelAnimation(index: Int) {
+        val mesh = selectedAnimationMesh()
+        if (mesh == null || index !in mesh.animationNames.indices) {
+            _uiState.value = _uiState.value.copy(saveToastMessage = "No animation clip at that index.")
+            return
+        }
+        mesh.selectAnimation(index)
+        _uiState.value = _uiState.value.copy(
+            animationMenuExpanded = false,
+            activeAnimationName = mesh.activeAnimationName,
+            animationEnabled = mesh.isAnimationEnabled,
+            autoAnimationEnabled = mesh.isAutoAnimationEnabled,
+            saveToastMessage = "Playing animation: ${mesh.activeAnimationName}"
+        )
+    }
+
+    fun onJoystickMoved(dx: Float, dy: Float) {
+        val active = (dx * dx + dy * dy) > 0.005f
+        if (active != _uiState.value.isJoystickActive) {
+            _uiState.value = _uiState.value.copy(isJoystickActive = active)
+        }
+
+        if (_uiState.value.isSpectatorMode && _uiState.value.isEditingObject) {
+            val pending = _uiState.value.pendingPlacement
+            if (pending != null && ::engine.isInitialized) {
+                val obj = engine.worldManager.objects.find { it.id == pending.objectId }
+                if (obj != null) {
+                    if (_uiState.value.isVerticalAdjustment) {
+                        val newY = (obj.position.y - dy * 0.22f).coerceIn(0.5f, 30f)
+                        obj.position.y = newY
+                        _uiState.value = _uiState.value.copy(
+                            activeObjectHeight = newY,
+                            pendingPlacement = pending.copy(currentPosition = obj.position.copy())
+                        )
+                    } else {
+                        val yawRad = Math.toRadians(engine.camera.yaw.toDouble())
+                        val cosY = Math.cos(yawRad).toFloat()
+                        val sinY = Math.sin(yawRad).toFloat()
+                        val speed = 0.22f
+                        val mx = (dx * cosY - dy * sinY) * speed
+                        val mz = (dx * sinY + dy * cosY) * speed
+                        obj.position.x = (obj.position.x + mx).coerceIn(-45f, 45f)
+                        obj.position.z = (obj.position.z + mz).coerceIn(-45f, 45f)
+                        _uiState.value = _uiState.value.copy(
+                            pendingPlacement = pending.copy(currentPosition = obj.position.copy())
+                        )
+                    }
+                }
+            }
+        } else {
+            engine.moveInputX = dx
+            engine.moveInputY = dy
+        }
+    }
+
+    fun onCameraSwipe(panX: Float, panY: Float) {
+        engine.rotateCamera(panX, panY)
+    }
+
+    fun onZoomDelta(delta: Float) {
+        engine.zoomCamera(delta)
+    }
+
+    fun onZoomIn() {
+        engine.zoomCamera(-200f)
+        triggerHapticThrottled(20, 50)
+    }
+
+    fun onZoomOut() {
+        engine.zoomCamera(200f)
+        triggerHapticThrottled(20, 50)
+    }
+
+    fun onJump() {
+        engine.performJump()
+    }
+
+    fun onAttack() {
+        engine.performAttack()
+    }
+
+    fun onDash() {
+        engine.performDash()
+    }
+
+    fun toggleSpectatorMode() {
+        val active = engine.camera.toggleSpectatorMode(engine.player.position)
+        _uiState.value = _uiState.value.copy(
+            isSpectatorMode = active,
+            isJoystickActive = false
+        )
+        triggerHapticThrottled(40, 50)
+    }
+
+    // --- Genshin Impact Teapot Swap & Placement Methods ---
+
+    fun getAvailableTargets(): List<Pair<String, String>> {
+        val list = ArrayList<Pair<String, String>>()
+        list.add("player_character" to "Player Character Avatar")
+        if (::engine.isInitialized) {
+            for (obj in engine.worldManager.objects) {
+                val label = when (obj.type) {
+                    ObjectType.PLATFORM, ObjectType.MOVING_PLATFORM -> "Platform: ${obj.name}"
+                    ObjectType.TRAINING_DUMMY -> "NPC: ${obj.name}"
+                    ObjectType.TARGET_CRYSTAL -> "Crystal Target: ${obj.name}"
+                    ObjectType.BREAKABLE_CRATE -> "Crate: ${obj.name}"
+                    ObjectType.BOUNCE_PAD -> "Bounce Pad: ${obj.name}"
+                    ObjectType.FLOATING_DRONE -> "Drone: ${obj.name}"
+                }
+                list.add(obj.id to label)
+            }
+        }
+        return list
+    }
+
+    fun selectTarget(targetId: String) {
+        val targets = getAvailableTargets()
+        val name = targets.find { it.first == targetId }?.second ?: targetId
+        val obj = if (::engine.isInitialized && targetId != "player_character") {
+            engine.worldManager.objects.find { it.id == targetId }
+        } else null
+
+        val pending = if (obj != null) {
+            PendingPlacementState(
+                objectId = obj.id,
+                objectName = obj.name,
+                originalPosition = obj.position.copy(),
+                currentPosition = obj.position.copy(),
+                isNewlyAdded = false,
+                modelId = com.example.teapot.ModelSwapManager.getActiveSwapModelId(obj.id)
+            )
+        } else {
+            null
+        }
+
+        _uiState.value = _uiState.value.copy(
+            selectedTargetId = targetId,
+            selectedTargetName = name,
+            pendingPlacement = pending,
+            isMovingObject = false
+        )
+        triggerHapticThrottled(25, 40)
+    }
+
+    fun cycleNextTarget() {
+        val targets = getAvailableTargets()
+        if (targets.isEmpty()) return
+        val currentIdx = targets.indexOfFirst { it.first == _uiState.value.selectedTargetId }
+        val nextIdx = if (currentIdx >= 0) (currentIdx + 1) % targets.size else 0
+        selectTarget(targets[nextIdx].first)
+    }
+
+    fun selectObjectAtScreenPos(touchX: Float, touchY: Float, glRenderer: com.example.graphics.GLGameRenderer): Boolean {
+        val objId = glRenderer.findObjectAtScreenPos(touchX, touchY)
+        if (objId != null) {
+            // A tap selects a swap target but does not hide the model drawer. The explicit Move
+            // button enters placement-edit mode, so tapping an object can be followed by a card tap.
+            selectTarget(objId)
+            return true
+        }
+        return false
+    }
+
+    fun spawnAndEditModel(modelId: String, glRenderer: com.example.graphics.GLGameRenderer? = null) {
+        if (!::engine.isInitialized) return
+        val model = com.example.teapot.TeapotModelRegistry.getModel(modelId) ?: return
+        val newObjId = "placed_${System.currentTimeMillis() % 100000}"
+
+        val categoryStr = model.category
+        // Use the actual imported mesh bounds for the placement collider; avoid assigning every
+        // high-detail GLB a tiny generic Companion box or an unrelated category size.
+        val modelSize = com.example.model.Vector3(
+            model.boundsSize.x.coerceIn(0.2f, 40f),
+            model.boundsSize.y.coerceIn(0.2f, 40f),
+            model.boundsSize.z.coerceIn(0.2f, 40f)
+        )
+
+        // Spawn centered in front of camera view
+        val cam = engine.camera
+        val yawRad = Math.toRadians(cam.yaw.toDouble())
+        val dist = 7.0f
+        val spawnX = engine.player.position.x - (Math.sin(yawRad) * dist).toFloat()
+        val spawnZ = engine.player.position.z - (Math.cos(yawRad) * dist).toFloat()
+        val spawnY = (engine.player.position.y + model.boundsSize.y * 0.5f)
+            .coerceAtLeast(model.boundsSize.y * 0.5f)
+
+        val newObj = com.example.game.WorldObject(
+            id = newObjId,
+            name = model.name,
+            position = com.example.model.Vector3(spawnX, spawnY, spawnZ),
+            size = modelSize,
+            color = model.defaultColor.clone(),
+            type = when (categoryStr) {
+                "Landform", "Building" -> com.example.game.ObjectType.PLATFORM
+                "Companion" -> com.example.game.ObjectType.TRAINING_DUMMY
+                else -> com.example.game.ObjectType.BREAKABLE_CRATE
+            },
+            maxHealth = 200f
+        )
+
+        engine.worldManager.addObject(newObj)
+        com.example.teapot.ModelSwapManager.applySwap(newObjId, modelId, engine.worldManager)
+        com.example.teapot.ModelSwapManager.recordPlacedObject(
+            newObjId, newObj.name, modelId,
+            newObj.position, newObj.size, categoryStr
+        )
+
+        _uiState.value = _uiState.value.copy(
+            selectedTargetId = newObjId,
+            selectedTargetName = model.name,
+            isEditingObject = true,
+            isVerticalAdjustment = false,
+            activeObjectHeight = spawnY,
+            activeObjectDescription = when (categoryStr) {
+                "Landform" -> "Can be placed side by side and can be stacked vertically."
+                "Building" -> "Architectural furnishing providing substantial Adeptal Energy."
+                "Companion" -> "Can interact and converse with companions in the realm."
+                else -> "Outdoor furnishing that elevates realm aesthetics."
+            },
+            pendingPlacement = PendingPlacementState(
+                objectId = newObjId,
+                objectName = model.name,
+                originalPosition = newObj.position.copy(),
+                currentPosition = newObj.position.copy(),
+                isNewlyAdded = true,
+                modelId = modelId
+            )
+        )
+        triggerHapticThrottled(40, 50)
+    }
+
+    fun selectAndEditObject(objectId: String) {
+        if (!::engine.isInitialized || objectId == "player_character") return
+        val obj = engine.worldManager.objects.find { it.id == objectId } ?: return
+
+        _uiState.value = _uiState.value.copy(
+            selectedTargetId = objectId,
+            selectedTargetName = obj.name,
+            isEditingObject = true,
+            isVerticalAdjustment = false,
+            activeObjectHeight = obj.position.y,
+            activeObjectDescription = "Can be placed side by side and can be stacked vertically.",
+            pendingPlacement = PendingPlacementState(
+                objectId = obj.id,
+                objectName = obj.name,
+                originalPosition = obj.position.copy(),
+                currentPosition = obj.position.copy(),
+                isNewlyAdded = false,
+                modelId = com.example.teapot.ModelSwapManager.getActiveSwapModelId(obj.id)
+            )
+        )
+        triggerHapticThrottled(35, 45)
+    }
+
+    fun toggleAdjustmentMode() {
+        val next = !_uiState.value.isVerticalAdjustment
+        _uiState.value = _uiState.value.copy(isVerticalAdjustment = next)
+        triggerHapticThrottled(30, 40)
+    }
+
+    fun rotateActiveObject() {
+        val pending = _uiState.value.pendingPlacement ?: return
+        if (!::engine.isInitialized) return
+        val obj = engine.worldManager.objects.find { it.id == pending.objectId } ?: return
+
+        // Swap width and depth (90 degree rotation)
+        val tempX = obj.size.x
+        obj.size.x = obj.size.z
+        obj.size.z = tempX
+
+        val nextRot = (_uiState.value.activeObjectRotation + 90f) % 360f
+        _uiState.value = _uiState.value.copy(activeObjectRotation = nextRot)
+        triggerHapticThrottled(35, 45)
+    }
+
+    fun confirmActivePlacement() {
+        confirmPendingPlacement()
+        _uiState.value = _uiState.value.copy(isEditingObject = false)
+    }
+
+    fun cancelActivePlacement() {
+        cancelPendingPlacement()
+        _uiState.value = _uiState.value.copy(isEditingObject = false)
+    }
+
+    fun updateMovingActiveObject(touchX: Float, touchY: Float, glRenderer: com.example.graphics.GLGameRenderer) {
+        val pending = _uiState.value.pendingPlacement ?: return
+        val obj = engine.worldManager.objects.find { it.id == pending.objectId } ?: return
+
+        if (_uiState.value.isVerticalAdjustment) {
+            val screenH = glRenderer.screenHeight.toFloat().coerceAtLeast(1f)
+            val normalizedY = 1.0f - (touchY / screenH)
+            val newHeight = (normalizedY * 30.0f).coerceIn(0.5f, 30.0f)
+            obj.position.y = newHeight
+            _uiState.value = _uiState.value.copy(
+                activeObjectHeight = newHeight,
+                pendingPlacement = pending.copy(currentPosition = obj.position.copy())
+            )
+        } else {
+            val hit = glRenderer.raycastPlacement(touchX, touchY, excludedId = pending.objectId)
+            if (hit != null) {
+                val newY = hit.placementPos.y + (obj.size.y * 0.5f)
+                obj.position.x = hit.placementPos.x
+                obj.position.y = newY
+                obj.position.z = hit.placementPos.z
+
+                glRenderer.hoverPreviewPosition = hit.placementPos
+                glRenderer.hoverPreviewSize = com.example.model.Vector3(obj.size.x, obj.size.y, obj.size.z)
+
+                _uiState.value = _uiState.value.copy(
+                    activeObjectHeight = newY,
+                    pendingPlacement = pending.copy(currentPosition = obj.position.copy())
+                )
+            }
+        }
+    }
+
+    fun onModelDragHover(
+        screenX: Float,
+        screenY: Float,
+        glRenderer: com.example.graphics.GLGameRenderer,
+        modelId: String? = null
+    ) {
+        val hit = glRenderer.raycastPlacement(screenX, screenY)
+        if (hit != null) {
+            glRenderer.hoverPreviewPosition = hit.placementPos
+            val bounds = modelId?.let { TeapotModelRegistry.getModel(it)?.boundsSize }
+            glRenderer.hoverPreviewSize = if (bounds != null) {
+                com.example.model.Vector3(bounds.x, bounds.y, bounds.z)
+            } else {
+                com.example.model.Vector3(2.2f, 1.4f, 2.2f)
+            }
+        } else {
+            glRenderer.hoverPreviewPosition = null
+            glRenderer.hoverPreviewSize = null
+        }
+    }
+
+    fun onModelDragCancel(glRenderer: com.example.graphics.GLGameRenderer) {
+        glRenderer.hoverPreviewPosition = null
+        glRenderer.hoverPreviewSize = null
+    }
+
+    fun onModelDragEnd(
+        screenX: Float,
+        screenY: Float,
+        modelId: String,
+        glRenderer: com.example.graphics.GLGameRenderer
+    ): Boolean {
+        glRenderer.hoverPreviewPosition = null
+        glRenderer.hoverPreviewSize = null
+        val hit = glRenderer.raycastPlacement(screenX, screenY)
+        if (hit != null) {
+            placeFurnishingOnObject(modelId, hit.hitObject, hit.placementPos)
+            return true
+        }
+        _uiState.value = _uiState.value.copy(
+            saveToastMessage = "Drop the model onto a visible 3D surface to place a copy. Tap a card to swap instead."
+        )
+        return false
+    }
+
+    fun placeFurnishingOnObject(modelId: String, targetObject: com.example.game.WorldObject, placementPos: com.example.model.Vector3) {
+        if (!::engine.isInitialized) return
+        val model = com.example.teapot.TeapotModelRegistry.getModel(modelId) ?: return
+        val newObjId = "placed_${System.currentTimeMillis() % 100000}"
+
+        val categoryStr = model.category
+        val modelSize = when (categoryStr) {
+            "Landform" -> com.example.model.Vector3(4.0f, 1.2f, 4.0f)
+            "Building" -> com.example.model.Vector3(3.5f, 2.5f, 3.5f)
+            "Companion" -> com.example.model.Vector3(1.2f, 2.2f, 1.2f)
+            else -> com.example.model.Vector3(2.0f, 1.6f, 2.0f)
+        }
+
+        val placementSize = com.example.model.Vector3(
+            model.boundsSize.x.coerceAtLeast(0.1f),
+            model.boundsSize.y.coerceAtLeast(0.1f),
+            model.boundsSize.z.coerceAtLeast(0.1f)
+        )
+        val placedY = placementPos.y + (placementSize.y * 0.5f)
+        val newObj = com.example.game.WorldObject(
+            id = newObjId,
+            name = "${model.name} (${targetObject.name})",
+            position = com.example.model.Vector3(placementPos.x, placedY, placementPos.z),
+            size = placementSize,
+            color = model.defaultColor.clone(),
+            type = when (categoryStr) {
+                "Landform", "Building" -> com.example.game.ObjectType.PLATFORM
+                "Companion" -> com.example.game.ObjectType.TRAINING_DUMMY
+                else -> com.example.game.ObjectType.BREAKABLE_CRATE
+            },
+            maxHealth = 200f
+        )
+
+        engine.worldManager.addObject(newObj)
+        com.example.teapot.ModelSwapManager.applySwap(newObjId, modelId, engine.worldManager)
+        com.example.teapot.ModelSwapManager.recordPlacedObject(
+            newObjId, newObj.name, modelId,
+            newObj.position, newObj.size, categoryStr
+        )
+
+        selectTarget(newObjId)
+        triggerHapticThrottled(50, 60)
+
+        // Set pending confirmation state so user can confirm with ✓ or cancel with ✕
+        _uiState.value = _uiState.value.copy(
+            isEditingObject = true,
+            isVerticalAdjustment = false,
+            activeObjectHeight = placedY,
+            activeObjectDescription = when (categoryStr) {
+                "Landform" -> "Can be placed side by side and stacked vertically."
+                "Building" -> "Architectural furnishing. Move, rotate, or adjust its height."
+                "Companion" -> "Placed companion model. Its target/gameplay type is retained."
+                else -> "Imported furnishing. Move, rotate, or adjust its height."
+            },
+            pendingPlacement = PendingPlacementState(
+                objectId = newObjId,
+                objectName = model.name,
+                originalPosition = newObj.position.copy(),
+                currentPosition = newObj.position.copy(),
+                isNewlyAdded = true,
+                modelId = modelId
+            ),
+            saveToastMessage = "Model placed. Adjust it, then tap ✓ to confirm or ✕ to cancel."
+        )
+    }
+
+    fun startMovingSelectedObject() {
+        val targetId = _uiState.value.selectedTargetId
+        if (targetId == "player_character" || !::engine.isInitialized) return
+        val obj = engine.worldManager.objects.find { it.id == targetId } ?: return
+
+        _uiState.value = _uiState.value.copy(
+            isMovingObject = true,
+            isEditingObject = true,
+            isVerticalAdjustment = false,
+            activeObjectHeight = obj.position.y,
+            activeObjectDescription = "Move the selected object with the drag area, then tap ✓ to save or ✕ to revert.",
+            pendingPlacement = PendingPlacementState(
+                objectId = obj.id,
+                objectName = obj.name,
+                originalPosition = obj.position.copy(),
+                currentPosition = obj.position.copy(),
+                isNewlyAdded = false,
+                modelId = com.example.teapot.ModelSwapManager.getActiveSwapModelId(obj.id)
+            )
+        )
+        triggerHapticThrottled(30, 40)
+    }
+
+    fun updateMovingSelectedObject(touchX: Float, touchY: Float, glRenderer: com.example.graphics.GLGameRenderer) {
+        val pending = _uiState.value.pendingPlacement ?: return
+        val obj = engine.worldManager.objects.find { it.id == pending.objectId } ?: return
+
+        // Raycast against all objects excluding the one being dragged
+        val hit = glRenderer.raycastPlacement(touchX, touchY, excludedId = pending.objectId)
+        if (hit != null) {
+            val newY = hit.placementPos.y + (obj.size.y * 0.5f)
+            obj.position.x = hit.placementPos.x
+            obj.position.y = newY
+            obj.position.z = hit.placementPos.z
+
+            glRenderer.hoverPreviewPosition = hit.placementPos
+            glRenderer.hoverPreviewSize = com.example.model.Vector3(obj.size.x, obj.size.y, obj.size.z)
+
+            _uiState.value = _uiState.value.copy(
+                pendingPlacement = pending.copy(currentPosition = obj.position.copy())
+            )
+        }
+    }
+
+    fun finishMovingSelectedObject(glRenderer: com.example.graphics.GLGameRenderer) {
+        glRenderer.hoverPreviewPosition = null
+        _uiState.value = _uiState.value.copy(isMovingObject = false)
+        triggerHapticThrottled(40, 50)
+    }
+
+    fun confirmPendingPlacement() {
+        val pending = _uiState.value.pendingPlacement ?: return
+        if (::engine.isInitialized) {
+            val obj = engine.worldManager.objects.find { it.id == pending.objectId }
+            val modelId = pending.modelId
+            if (obj != null && modelId != null) {
+                // Update a record only for objects created by the furnishing-placement system.
+                // Moving a gameplay target must not silently turn it into a saved furnishing.
+                val existingRecord = com.example.teapot.ModelSwapManager.getPlacedObjects()
+                    .firstOrNull { it.id == obj.id }
+                if (existingRecord != null) {
+                    val category = com.example.teapot.TeapotModelRegistry.getModel(modelId)?.category
+                        ?: existingRecord.category
+                    com.example.teapot.ModelSwapManager.recordPlacedObject(
+                        obj.id, obj.name, modelId, obj.position, obj.size, category
+                    )
+                }
+            }
+        }
+        // Save to persistent storage
+        saveFurnishings()
+        _uiState.value = _uiState.value.copy(
+            pendingPlacement = null,
+            isMovingObject = false,
+            saveToastMessage = "Placement Confirmed & Saved!"
+        )
+        triggerHapticThrottled(60, 70)
+    }
+
+    fun cancelPendingPlacement() {
+        val pending = _uiState.value.pendingPlacement ?: return
+        if (::engine.isInitialized) {
+            if (pending.isNewlyAdded) {
+                // Remove newly spawned object
+                engine.worldManager.removeObject(pending.objectId)
+                com.example.teapot.ModelSwapManager.removeSwap(pending.objectId)
+                com.example.teapot.ModelSwapManager.removePlacedObject(pending.objectId)
+            } else {
+                // Revert existing object back to original position
+                val obj = engine.worldManager.objects.find { it.id == pending.objectId }
+                if (obj != null) {
+                    obj.position.x = pending.originalPosition.x
+                    obj.position.y = pending.originalPosition.y
+                    obj.position.z = pending.originalPosition.z
+                }
+            }
+        }
+        _uiState.value = _uiState.value.copy(
+            pendingPlacement = null,
+            isMovingObject = false,
+            saveToastMessage = if (pending.isNewlyAdded) "Placement Cancelled" else "Reverted to Original Position"
+        )
+        triggerHapticThrottled(40, 50)
+    }
+
+    // Exit Spectator Dialog actions (Requirement 3)
+    fun requestExitSpectator() {
+        _uiState.value = _uiState.value.copy(showExitConfirmationDialog = true)
+        triggerHapticThrottled(30, 40)
+    }
+
+    fun dismissExitSpectatorDialog() {
+        _uiState.value = _uiState.value.copy(showExitConfirmationDialog = false)
+    }
+
+    fun saveAndExitSpectator() {
+        if (_uiState.value.pendingPlacement != null) {
+            confirmPendingPlacement()
+        }
+        saveFurnishings()
+        // The UI state is synchronized from engine.camera every 50 ms. Set the engine flag too,
+        // or syncUIState() immediately turns Spectator Mode back on after the dialog closes.
+        if (::engine.isInitialized) {
+            engine.camera.isSpectatorMode = false
+            engine.moveInputX = 0f
+            engine.moveInputY = 0f
+        }
+        _uiState.value = _uiState.value.copy(
+            showExitConfirmationDialog = false,
+            isSpectatorMode = false,
+            isJoystickActive = false,
+            pendingPlacement = null,
+            isEditingObject = false,
+            isMovingObject = false,
+            isVerticalAdjustment = false,
+            saveToastMessage = "Furnishings Saved. Returned to Action Mode!"
+        )
+        triggerHapticThrottled(70, 80)
+    }
+
+    fun discardAndExitSpectator() {
+        if (_uiState.value.pendingPlacement != null) {
+            cancelPendingPlacement()
+        }
+        appContext?.let { ctx ->
+            if (::engine.isInitialized) {
+                engine.worldManager.createDefaultWorld()
+                ModelSwapManager.loadSwapsFromStorage(ctx, engine.worldManager)
+            }
+        }
+        if (::engine.isInitialized) {
+            // Same engine/UI invariant as Save & Exit: switch the camera itself off first.
+            engine.camera.isSpectatorMode = false
+            engine.moveInputX = 0f
+            engine.moveInputY = 0f
+        }
+        _uiState.value = _uiState.value.copy(
+            showExitConfirmationDialog = false,
+            isSpectatorMode = false,
+            isJoystickActive = false,
+            pendingPlacement = null,
+            isEditingObject = false,
+            isMovingObject = false,
+            isVerticalAdjustment = false,
+            saveToastMessage = "Changes Discarded. Returned to Action Mode."
+        )
+        triggerHapticThrottled(50, 60)
+    }
+
+    fun swapModelForSelectedTarget(modelId: String) {
+        if (!::engine.isInitialized) return
+        val model = TeapotModelRegistry.getModel(modelId) ?: return
+        val targetId = _uiState.value.selectedTargetId
+        val targetObject = if (targetId == "player_character") null else {
+            engine.worldManager.objects.find { it.id == targetId }
+        }
+        if (targetId != "player_character" && targetObject == null) {
+            _uiState.value = _uiState.value.copy(saveToastMessage = "Select a character or existing world object first")
+            return
+        }
+
+        // Only the visual mesh and collision bounds change. WorldObject.type, health, attacks,
+        // movement controller, and other gameplay behavior remain attached to the selected target.
+        ModelSwapManager.applySwap(targetId, modelId, engine.worldManager)
+        val pendingPlacement = _uiState.value.pendingPlacement?.let { pending ->
+            if (pending.objectId == targetId) pending.copy(modelId = modelId) else pending
+        }
+        if (targetObject != null) {
+            val existingPlaced = ModelSwapManager.getPlacedObjects().firstOrNull { it.id == targetId }
+            if (existingPlaced != null) {
+                ModelSwapManager.recordPlacedObject(
+                    targetObject.id, targetObject.name, modelId,
+                    targetObject.position, targetObject.size, model.category
+                )
+            }
+        }
+        val saved = appContext?.let { ModelSwapManager.saveSwapsToStorage(it) } ?: false
+        triggerHapticThrottled(40, 50)
+        _uiState.value = _uiState.value.copy(
+            pendingPlacement = pendingPlacement,
+            lastSwapTimestamp = System.currentTimeMillis(),
+            saveToastMessage = if (saved) "${model.name} applied to ${if (targetId == "player_character") "Player Character" else targetObject?.name ?: "object"} and saved"
+                else "${model.name} applied; persistence save failed"
+        )
+    }
+
+    fun saveFurnishings() {
+        appContext?.let { ctx ->
+            val success = ModelSwapManager.saveSwapsToStorage(ctx)
+            triggerHapticThrottled(70, 80)
+            _uiState.value = _uiState.value.copy(
+                saveToastMessage = if (success) "Furnishing Placements Saved Successfully!" else "Failed to Save Swaps"
+            )
+        }
+    }
+
+    fun clearSaveToast() {
+        _uiState.value = _uiState.value.copy(saveToastMessage = null)
+    }
+
+    private var modelImportRunning = false
+
+    fun importModelFile(uri: Uri, fileName: String) {
+        val context = appContext ?: return
+        if (modelImportRunning) {
+            _uiState.value = _uiState.value.copy(saveToastMessage = "A model is already importing. Please wait.")
+            return
+        }
+        modelImportRunning = true
+        _uiState.value = _uiState.value.copy(saveToastMessage = "Importing $fileName…")
+
+        viewModelScope.launch {
+            try {
+                // File copying, parsing, texture decoding and mesh batching all happen off the UI thread.
+                val importedMesh = withContext(Dispatchers.IO) {
+                    TeapotModelRegistry.importModelFromUri(context, uri, fileName)
+                }
+                if (importedMesh != null) {
+                    swapModelForSelectedTarget(importedMesh.id)
+                    val lodNote = if (importedMesh.wasReducedForMobile) " (simplified for mobile rendering)" else ""
+                    val textureNote = importedMesh.importWarning?.let { " (some texture data was skipped)" }.orEmpty()
+                    _uiState.value = _uiState.value.copy(
+                        saveToastMessage = "Imported '${importedMesh.name}'$lodNote and applied it to the selected target.$textureNote"
+                    )
+                } else {
+                    val reason = TeapotModelRegistry.lastImportError ?: "Unsupported or invalid 3D model file."
+                    _uiState.value = _uiState.value.copy(saveToastMessage = "Model import failed: $reason")
+                }
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    saveToastMessage = "Model import failed: ${e.message ?: e.javaClass.simpleName}"
+                )
+            } finally {
+                modelImportRunning = false
+            }
+        }
+    }
+
+    fun toggleMultiSelect() {
+        val next = !_uiState.value.isMultiSelect
+        _uiState.value = _uiState.value.copy(isMultiSelect = next)
+        triggerHapticThrottled(25, 50)
+    }
+
+    fun rotateSelectedTarget() {
+        // Rotates the spectator camera or target orientation
+        engine.camera.yaw = (engine.camera.yaw + 45f) % 360f
+        triggerHapticThrottled(30, 50)
+    }
+
+    fun cycleTeapotArea(forward: Boolean) {
+        if (forward) {
+            currentAreaIndex = (currentAreaIndex + 1) % teapotAreas.size
+        } else {
+            currentAreaIndex = if (currentAreaIndex - 1 < 0) teapotAreas.size - 1 else currentAreaIndex - 1
+        }
+        _uiState.value = _uiState.value.copy(teapotAreaName = teapotAreas[currentAreaIndex])
+        triggerHapticThrottled(25, 50)
+    }
+
+    fun onOpenSettings() {
+        _uiState.value = _uiState.value.copy(isSettingsOpen = true)
+    }
+
+    fun onCloseSettings() {
+        _uiState.value = _uiState.value.copy(isSettingsOpen = false)
+    }
+
+    fun updateSettings(newSettings: GameSettings) {
+        engine.settings = newSettings
+        _uiState.value = _uiState.value.copy(settings = newSettings)
+        appContext?.let {
+            GameSettingsStorage.saveSettings(it, newSettings)
+        }
+    }
+
+    fun snapCameraToNorth() {
+        engine.camera.yaw = 180f
+        triggerHapticThrottled(25, 50)
+    }
+
+    fun onResetPlayer() {
+        engine.respawnPlayerAtNearestSafePlatform()
+        triggerHapticThrottled(40, 50)
+        syncUIState()
+    }
+
+    fun onResetWorld() {
+        engine.resetGame()
+        triggerHapticThrottled(60, 50)
+        syncUIState()
+    }
+
+    private fun triggerHapticThrottled(durationMs: Long, minIntervalMs: Long = 60) {
+        if (!engine.settings.hapticEnabled) return
+        val now = System.currentTimeMillis()
+        if (now - lastHapticTimestamp < minIntervalMs) return
+        lastHapticTimestamp = now
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator?.vibrate(VibrationEffect.createOneShot(durationMs, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(durationMs)
+            }
+        } catch (_: Exception) {}
+    }
+}

@@ -1,0 +1,427 @@
+package com.example.teapot
+
+import android.opengl.Matrix
+import kotlin.math.acos
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sqrt
+
+/** Node bind-pose data from a glTF 2.0 scene. Matrices are column-major. */
+data class GltfNodeData(
+    val parentIndex: Int,
+    val translation: FloatArray,
+    val rotation: FloatArray,
+    val scale: FloatArray,
+    val matrix: FloatArray? = null
+)
+
+data class GltfSkinData(
+    val joints: IntArray,
+    /** One column-major 4x4 inverse-bind matrix per entry in [joints]. */
+    val inverseBindMatrices: List<FloatArray>
+)
+
+data class GltfAnimationSamplerData(
+    val times: FloatArray,
+    val values: FloatArray,
+    val componentCount: Int,
+    val interpolation: String
+)
+
+data class GltfAnimationChannelData(
+    val samplerIndex: Int,
+    val nodeIndex: Int,
+    val path: String
+)
+
+data class GltfAnimationClipData(
+    val name: String,
+    val samplers: List<GltfAnimationSamplerData>,
+    val channels: List<GltfAnimationChannelData>,
+    val durationSeconds: Float
+)
+
+/** Per-render-part source skin values, remapped to the renderer's compact local vertex batch. */
+data class GltfSkinningPartData(
+    val skinIndex: Int,
+    val sourcePositions: FloatArray,
+    val sourceNormals: FloatArray,
+    /** Four integer joint palette indices per local vertex. */
+    val joints: IntArray,
+    /** Four normalized weights per local vertex. */
+    val weights: FloatArray
+)
+
+/**
+ * Small CPU skinning runtime for ordinary glTF LINEAR/STEP/CUBICSPLINE bone animation tracks.
+ * It intentionally leaves parsing and draw calls outside of the UI layer. Geometry buffers are
+ * only changed on the OpenGL render thread.
+ */
+class GltfAnimationRuntime(
+    val nodes: List<GltfNodeData>,
+    val skins: List<GltfSkinData>,
+    val clips: List<GltfAnimationClipData>,
+    private val boundsCenter: FloatArray,
+    private val coordinateScale: Float
+) {
+    @Volatile var isEnabled: Boolean = clips.isNotEmpty()
+        private set
+    @Volatile var autoMode: Boolean = clips.isNotEmpty()
+        private set
+    @Volatile var selectedClipIndex: Int = findDefaultClipIndex()
+        private set
+    @Volatile var speed: Float = 1f
+        private set
+
+    private var elapsedSeconds = 0f
+    private var lastFrameToken = Long.MIN_VALUE
+    private var lastClipApplied = -1
+    private var poseIsApplied = false
+
+    val animationNames: List<String> get() = clips.map { it.name }
+    val selectedAnimationName: String? get() = clips.getOrNull(selectedClipIndex)?.name
+    val supportsSkeletalAnimation: Boolean get() = skins.isNotEmpty() && clips.any { clip ->
+        clip.channels.any { channel ->
+            channel.path in setOf("translation", "rotation", "scale") &&
+                skins.any { skin -> skin.joints.contains(channel.nodeIndex) }
+        }
+    }
+
+    @Synchronized
+    fun setEnabled(enabled: Boolean) {
+        isEnabled = enabled && clips.isNotEmpty()
+    }
+
+    @Synchronized
+    fun setAutoMode(enabled: Boolean) {
+        autoMode = enabled && clips.isNotEmpty()
+        if (autoMode) isEnabled = true
+    }
+
+    @Synchronized
+    fun setSpeed(multiplier: Float) {
+        speed = multiplier.coerceIn(0.1f, 3f)
+    }
+
+    @Synchronized
+    fun selectAnimation(index: Int) {
+        if (index !in clips.indices) return
+        selectedClipIndex = index
+        autoMode = false
+        isEnabled = true
+    }
+
+    @Synchronized
+    fun selectAnimation(name: String): Boolean {
+        val index = clips.indexOfFirst { it.name.equals(name, ignoreCase = true) }
+        if (index < 0) return false
+        selectAnimation(index)
+        return true
+    }
+
+    @Synchronized
+    fun nextAnimation() {
+        if (clips.isEmpty()) return
+        selectedClipIndex = (selectedClipIndex + 1) % clips.size
+        autoMode = false
+        isEnabled = true
+    }
+
+    /** Called once per render frame. Duplicate model instances of one asset share the current clip. */
+    @Synchronized
+    fun update(
+        parts: List<Custom3DMeshPart>,
+        deltaSeconds: Float,
+        frameToken: Long,
+        playerAction: String? = null,
+        horizontalSpeed: Float = 0f
+    ) {
+        if (frameToken == lastFrameToken) return
+        lastFrameToken = frameToken
+
+        if (clips.isEmpty() || !parts.any { it.skinningData != null }) {
+            if (poseIsApplied) restoreBindPose(parts)
+            return
+        }
+        if (!isEnabled) {
+            // OFF means pause on the current frame, not reset the skeleton to its authored rest
+            // pose. A rest pose may look like a sleeping/lying character depending on the source rig.
+            // The parser has already prepared the initial bind pose, so disabling before the first
+            // animation frame remains safe as well.
+            return
+        }
+
+        if (autoMode && playerAction != null) {
+            val autoIndex = findClipForAction(playerAction, horizontalSpeed)
+            if (autoIndex >= 0 && autoIndex != selectedClipIndex) {
+                selectedClipIndex = autoIndex
+            }
+        }
+
+        val clip = clips.getOrNull(selectedClipIndex) ?: return
+        if (lastClipApplied != selectedClipIndex) {
+            elapsedSeconds = 0f
+            lastClipApplied = selectedClipIndex
+        } else {
+            elapsedSeconds += deltaSeconds.coerceIn(0f, 0.05f) * speed
+        }
+        val duration = clip.durationSeconds
+        val time = if (duration > 0.0001f) {
+            var t = elapsedSeconds % duration
+            if (t < 0f) t += duration
+            t
+        } else 0f
+
+        // Start each frame from the authored bind pose; apply only channels in the current clip.
+        val translations = Array(nodes.size) { nodes[it].translation.clone() }
+        val rotations = Array(nodes.size) { nodes[it].rotation.clone() }
+        val scales = Array(nodes.size) { nodes[it].scale.clone() }
+        val matrixAnimatedNode = BooleanArray(nodes.size)
+        for (channel in clip.channels) {
+            if (channel.nodeIndex !in nodes.indices) continue
+            val sampler = clip.samplers.getOrNull(channel.samplerIndex) ?: continue
+            val value = sample(sampler, time, channel.path == "rotation") ?: continue
+            when (channel.path) {
+                "translation" -> if (value.size >= 3) {
+                    translations[channel.nodeIndex][0] = value[0]
+                    translations[channel.nodeIndex][1] = value[1]
+                    translations[channel.nodeIndex][2] = value[2]
+                    matrixAnimatedNode[channel.nodeIndex] = true
+                }
+                "rotation" -> if (value.size >= 4) {
+                    normalizeQuaternion(value)
+                    System.arraycopy(value, 0, rotations[channel.nodeIndex], 0, 4)
+                    matrixAnimatedNode[channel.nodeIndex] = true
+                }
+                "scale" -> if (value.size >= 3) {
+                    scales[channel.nodeIndex][0] = value[0]
+                    scales[channel.nodeIndex][1] = value[1]
+                    scales[channel.nodeIndex][2] = value[2]
+                    matrixAnimatedNode[channel.nodeIndex] = true
+                }
+                // Morph-weight animation requires per-target vertex deltas, not joint skinning.
+                else -> Unit
+            }
+        }
+
+        val localMatrices = Array(nodes.size) { index ->
+            val node = nodes[index]
+            if (node.matrix != null && !matrixAnimatedNode[index]) node.matrix.clone()
+            else composeTrs(translations[index], rotations[index], scales[index])
+        }
+        val globalMatrices = Array(nodes.size) { FloatArray(16) }
+        val status = IntArray(nodes.size)
+
+        fun computeGlobal(index: Int) {
+            if (index !in nodes.indices || status[index] == 2) return
+            if (status[index] == 1) return // protect the renderer from malformed node cycles
+            status[index] = 1
+            val parent = nodes[index].parentIndex
+            if (parent in nodes.indices && parent != index) {
+                computeGlobal(parent)
+                Matrix.multiplyMM(globalMatrices[index], 0, globalMatrices[parent], 0, localMatrices[index], 0)
+            } else {
+                System.arraycopy(localMatrices[index], 0, globalMatrices[index], 0, 16)
+            }
+            status[index] = 2
+        }
+        for (i in nodes.indices) computeGlobal(i)
+
+        val skinPalettes = Array(skins.size) { skinIndex ->
+            val skin = skins[skinIndex]
+            Array(skin.joints.size) { jointSlot ->
+                val out = FloatArray(16)
+                val nodeIndex = skin.joints[jointSlot]
+                val inverseBind = skin.inverseBindMatrices.getOrNull(jointSlot) ?: identityMatrix()
+                if (nodeIndex in globalMatrices.indices) {
+                    Matrix.multiplyMM(out, 0, globalMatrices[nodeIndex], 0, inverseBind, 0)
+                } else {
+                    System.arraycopy(inverseBind, 0, out, 0, 16)
+                }
+                out
+            }
+        }
+
+        parts.forEach { part ->
+            val binding = part.skinningData ?: return@forEach
+            val palette = skinPalettes.getOrNull(binding.skinIndex) ?: return@forEach
+            val vertexCount = binding.sourcePositions.size / 3
+            if (vertexCount == 0 || binding.joints.size < vertexCount * 4 || binding.weights.size < vertexCount * 4) return@forEach
+            val outputPositions = FloatArray(vertexCount * 3)
+            val outputNormals = FloatArray(vertexCount * 3)
+            for (vertex in 0 until vertexCount) {
+                val src = vertex * 3
+                val jointBase = vertex * 4
+                val px = binding.sourcePositions[src]
+                val py = binding.sourcePositions[src + 1]
+                val pz = binding.sourcePositions[src + 2]
+                val nx = binding.sourceNormals.getOrElse(src) { 0f }
+                val ny = binding.sourceNormals.getOrElse(src + 1) { 1f }
+                val nz = binding.sourceNormals.getOrElse(src + 2) { 0f }
+                var outX = 0f; var outY = 0f; var outZ = 0f
+                var outNx = 0f; var outNy = 0f; var outNz = 0f
+                var sumWeights = 0f
+                for (influence in 0..3) {
+                    val w = binding.weights[jointBase + influence].coerceAtLeast(0f)
+                    val jointSlot = binding.joints[jointBase + influence]
+                    if (w <= 0.00001f || jointSlot !in palette.indices) continue
+                    val m = palette[jointSlot]
+                    outX += (m[0] * px + m[4] * py + m[8] * pz + m[12]) * w
+                    outY += (m[1] * px + m[5] * py + m[9] * pz + m[13]) * w
+                    outZ += (m[2] * px + m[6] * py + m[10] * pz + m[14]) * w
+                    outNx += (m[0] * nx + m[4] * ny + m[8] * nz) * w
+                    outNy += (m[1] * nx + m[5] * ny + m[9] * nz) * w
+                    outNz += (m[2] * nx + m[6] * ny + m[10] * nz) * w
+                    sumWeights += w
+                }
+                if (sumWeights <= 0.00001f) {
+                    // Preserve vertices with missing/zero skin weights rather than collapsing them.
+                    outputPositions[src] = part.restPositions[src]
+                    outputPositions[src + 1] = part.restPositions[src + 1]
+                    outputPositions[src + 2] = part.restPositions[src + 2]
+                    outputNormals[src] = part.restNormals[src]
+                    outputNormals[src + 1] = part.restNormals[src + 1]
+                    outputNormals[src + 2] = part.restNormals[src + 2]
+                } else {
+                    val inverseWeight = if (sumWeights > 1.0001f || sumWeights < 0.9999f) 1f / sumWeights else 1f
+                    outputPositions[src] = (outX * inverseWeight - boundsCenter[0]) * coordinateScale
+                    outputPositions[src + 1] = (outY * inverseWeight - boundsCenter[1]) * coordinateScale
+                    outputPositions[src + 2] = (outZ * inverseWeight - boundsCenter[2]) * coordinateScale
+                    val nLen = sqrt(outNx * outNx + outNy * outNy + outNz * outNz).coerceAtLeast(0.00001f)
+                    outputNormals[src] = outNx / nLen
+                    outputNormals[src + 1] = outNy / nLen
+                    outputNormals[src + 2] = outNz / nLen
+                }
+            }
+            part.writeAnimatedBuffers(outputPositions, outputNormals)
+        }
+        poseIsApplied = true
+    }
+
+    private fun restoreBindPose(parts: List<Custom3DMeshPart>) {
+        parts.forEach(Custom3DMeshPart::restoreBindPose)
+        poseIsApplied = false
+        lastClipApplied = -1
+    }
+
+    private fun findDefaultClipIndex(): Int {
+        if (clips.isEmpty()) return -1
+        val idle = clips.indexOfFirst { it.name.contains("idle", ignoreCase = true) }
+        return if (idle >= 0) idle else 0
+    }
+
+    private fun findClipForAction(action: String, horizontalSpeed: Float): Int {
+        val desired = when {
+            action.equals("DASHING", ignoreCase = true) || horizontalSpeed >= 5.0f -> listOf("run", "sprint", "jog", "walk", "idle")
+            action.equals("WALKING", ignoreCase = true) || horizontalSpeed >= 0.2f -> listOf("walk", "run", "jog", "idle")
+            else -> listOf("idle", "stand", "walk", "run")
+        }
+        for (part in desired) {
+            val index = clips.indexOfFirst { it.name.contains(part, ignoreCase = true) }
+            if (index >= 0) return index
+        }
+        return -1
+    }
+
+    private fun sample(sampler: GltfAnimationSamplerData, time: Float, quaternion: Boolean): FloatArray? {
+        val times = sampler.times
+        val components = sampler.componentCount
+        if (times.isEmpty() || components <= 0 || sampler.values.isEmpty()) return null
+        if (times.size == 1 || time <= times.first()) return keyValue(sampler, 0, value = true)
+        if (time >= times.last()) return keyValue(sampler, times.lastIndex, value = true)
+
+        var low = 0
+        var high = times.lastIndex
+        while (low + 1 < high) {
+            val mid = (low + high) ushr 1
+            if (times[mid] <= time) low = mid else high = mid
+        }
+        val t0 = times[low]
+        val t1 = times[high]
+        val dt = (t1 - t0).coerceAtLeast(0.000001f)
+        val factor = ((time - t0) / dt).coerceIn(0f, 1f)
+        when (sampler.interpolation.uppercase()) {
+            "STEP" -> return keyValue(sampler, low, value = true)
+            "CUBICSPLINE" -> {
+                val p0 = keyValue(sampler, low, value = true)
+                val m0 = keyValue(sampler, low, value = false, tangent = "out")
+                val p1 = keyValue(sampler, high, value = true)
+                val m1 = keyValue(sampler, high, value = false, tangent = "in")
+                val t2 = factor * factor
+                val t3 = t2 * factor
+                val h00 = 2f * t3 - 3f * t2 + 1f
+                val h10 = t3 - 2f * t2 + factor
+                val h01 = -2f * t3 + 3f * t2
+                val h11 = t3 - t2
+                val result = FloatArray(components) { i ->
+                    h00 * p0[i] + h10 * dt * m0[i] + h01 * p1[i] + h11 * dt * m1[i]
+                }
+                if (quaternion) normalizeQuaternion(result)
+                return result
+            }
+            else -> {
+                val p0 = keyValue(sampler, low, value = true)
+                val p1 = keyValue(sampler, high, value = true)
+                if (quaternion && components >= 4) return slerp(p0, p1, factor)
+                return FloatArray(components) { i -> p0[i] + (p1[i] - p0[i]) * factor }
+            }
+        }
+    }
+
+    private fun keyValue(
+        sampler: GltfAnimationSamplerData,
+        keyIndex: Int,
+        value: Boolean,
+        tangent: String = "in"
+    ): FloatArray {
+        val components = sampler.componentCount
+        val cubic = sampler.interpolation.equals("CUBICSPLINE", ignoreCase = true)
+        val lane = if (!cubic) 0 else when {
+            value -> 1
+            tangent == "out" -> 2
+            else -> 0
+        }
+        val offset = (keyIndex * (if (cubic) 3 else 1) + lane) * components
+        return FloatArray(components) { i -> sampler.values.getOrElse(offset + i) { 0f } }
+    }
+
+    private fun slerp(a: FloatArray, b: FloatArray, t: Float): FloatArray {
+        var cosTheta = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+        val target = b.clone()
+        if (cosTheta < 0f) {
+            cosTheta = -cosTheta
+            for (i in 0..3) target[i] = -target[i]
+        }
+        if (cosTheta > 0.9995f) return FloatArray(4) { i -> a[i] + (target[i] - a[i]) * t }.also(::normalizeQuaternion)
+        val theta = acos(cosTheta.coerceIn(-1f, 1f))
+        val sinTheta = kotlin.math.sin(theta).coerceAtLeast(0.000001f)
+        val left = kotlin.math.sin((1f - t) * theta) / sinTheta
+        val right = kotlin.math.sin(t * theta) / sinTheta
+        return FloatArray(4) { i -> a[i] * left + target[i] * right }.also(::normalizeQuaternion)
+    }
+
+    private fun normalizeQuaternion(q: FloatArray) {
+        if (q.size < 4) return
+        val len = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).coerceAtLeast(0.000001f)
+        for (i in 0..3) q[i] /= len
+    }
+
+    private fun composeTrs(t: FloatArray, qIn: FloatArray, s: FloatArray): FloatArray {
+        val q = qIn.clone()
+        normalizeQuaternion(q)
+        val x = q[0]; val y = q[1]; val z = q[2]; val w = q[3]
+        val xx = x * x; val yy = y * y; val zz = z * z
+        val xy = x * y; val xz = x * z; val yz = y * z
+        val wx = w * x; val wy = w * y; val wz = w * z
+        return floatArrayOf(
+            (1f - 2f * (yy + zz)) * s[0], (2f * (xy + wz)) * s[0], (2f * (xz - wy)) * s[0], 0f,
+            (2f * (xy - wz)) * s[1], (1f - 2f * (xx + zz)) * s[1], (2f * (yz + wx)) * s[1], 0f,
+            (2f * (xz + wy)) * s[2], (2f * (yz - wx)) * s[2], (1f - 2f * (xx + yy)) * s[2], 0f,
+            t[0], t[1], t[2], 1f
+        )
+    }
+
+    companion object {
+        fun identityMatrix() = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+    }
+}

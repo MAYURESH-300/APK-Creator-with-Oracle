@@ -1,0 +1,353 @@
+package com.example.game
+
+import com.example.model.Vector3
+import kotlin.math.*
+import com.example.sfx.GameFeedback
+/**
+ * High-performance 3D Game Engine.
+ * Thread-safe execution, instantaneous face-locking to hit targets,
+ * rapid combo attacks, and crash prevention.
+ */
+class GameEngine {
+
+    val player = RobloxCharacter(initialPosition = Vector3(0f, 1.5f, 0f))
+    val camera = ThirdPersonCamera()
+    val worldManager = WorldManager()
+    val particleSystem = ParticleSystem()
+    var settings = GameSettings()
+
+    // Game stats
+    var score: Int = 0
+    var hitCombo: Int = 0
+    var comboTimer: Float = 0f
+
+    // Thread-safe inputs from UI
+    @Volatile var moveInputX: Float = 0f
+    @Volatile var moveInputY: Float = 0f
+
+    @Volatile private var pendingJump: Boolean = false
+    @Volatile private var pendingAttack: Boolean = false
+    @Volatile private var pendingDash: Boolean = false
+
+    @Volatile private var pendingSwipeX: Float = 0f
+    @Volatile private var pendingSwipeY: Float = 0f
+    @Volatile private var pendingZoom: Float = 0f
+
+    // Pre-allocated vectors for zero-allocation combat queries
+    private val attackDir = Vector3()
+    private val hitCenter = Vector3()
+    private val sparkPos = Vector3()
+
+
+    // Callbacks for UI/Haptics
+    var onHitTarget: ((WorldObject, damage: Float, isCritical: Boolean) -> Unit)? = null
+    var onObjectDestroyed: ((WorldObject) -> Unit)? = null
+    var onJump: (() -> Unit)? = null
+    var onDash: (() -> Unit)? = null
+    var onBouncePad: (() -> Unit)? = null
+
+    // Physics constants
+    private val gravity = -26.0f
+    private val moveSpeed = 9.0f
+    private val groundFriction = 12.0f
+    private val airFriction = 2.0f
+    private val fallRespawnY = -12.0f
+
+    fun update(deltaTime: Float) {
+        val dt = deltaTime.coerceIn(0.001f, 0.05f)
+
+        // 1. Process queued Camera Gestures
+        processCameraInput()
+
+        // 2. Consume queued Actions safely on GLThread
+        if (pendingJump) {
+            pendingJump = false
+            executeJump()
+        }
+        if (pendingDash) {
+            pendingDash = false
+            executeDash()
+        }
+        if (pendingAttack) {
+            pendingAttack = false
+            executeAttack()
+        }
+
+        // 3. Update Combo Decay
+        if (comboTimer > 0f) {
+            comboTimer -= dt
+            if (comboTimer <= 0f) {
+                hitCombo = 0
+            }
+        }
+
+        // 4. Player Movement & Facing Direction
+        handlePlayerMovement(dt)
+
+        // 5. Physics & Platform Collisions
+        handlePlayerPhysics(dt)
+
+        // 6. Character Animation Updates
+        player.update(dt, settings.characterRotationMode)
+
+        // 7. World Objects Updates
+        worldManager.update(dt)
+
+        // 8. Particle System Updates
+        particleSystem.update(dt)
+
+        // 9. Camera Follow Target
+        camera.update(player.position, dt)
+    }
+
+    private fun processCameraInput() {
+        val sx = pendingSwipeX
+        val sy = pendingSwipeY
+        if (sx != 0f || sy != 0f) {
+            pendingSwipeX = 0f
+            pendingSwipeY = 0f
+            camera.rotate(sx, sy, settings.cameraSensitivity, settings.invertPitch)
+        }
+
+        val z = pendingZoom
+        if (z != 0f) {
+            pendingZoom = 0f
+            camera.zoomBy(z, settings.zoomSensitivity)
+        }
+    }
+
+    private fun handlePlayerMovement(dt: Float) {
+        if (camera.isSpectatorMode) {
+            // Requirement 2: Spectator Mode movement scaled with zoom distance
+            camera.moveSpectator(moveInputX, moveInputY, dt)
+            val friction = if (player.isGrounded) groundFriction else airFriction
+            player.velocity.x += (-player.velocity.x) * (friction * dt).coerceAtMost(1f)
+            player.velocity.z += (-player.velocity.z) * (friction * dt).coerceAtMost(1f)
+            return
+        }
+
+        if (!player.isDashing) {
+            val camForward = camera.forwardXZ
+            val camRight = camera.rightXZ
+
+            val moveDirX = camRight.x * moveInputX + camForward.x * moveInputY
+            val moveDirZ = camRight.z * moveInputX + camForward.z * moveInputY
+
+            val inputLength = sqrt(moveDirX * moveDirX + moveDirZ * moveDirZ)
+
+            if (inputLength > 0.05f) {
+                val normX = moveDirX / inputLength
+                val normZ = moveDirZ / inputLength
+                val targetSpeed = moveSpeed * inputLength.coerceAtMost(1f)
+
+                val accel = if (player.isGrounded) 45.0f else 18.0f
+                player.velocity.x += (normX * targetSpeed - player.velocity.x) * (accel * dt).coerceAtMost(1f)
+                player.velocity.z += (normZ * targetSpeed - player.velocity.z) * (accel * dt).coerceAtMost(1f)
+
+                when (settings.characterRotationMode) {
+                    CharacterRotationMode.ROTATING_TO_MOVEMENT -> {
+                        val heading = Math.toDegrees(atan2(normX.toDouble(), normZ.toDouble())).toFloat()
+                        player.targetRotationY = heading
+                    }
+                    CharacterRotationMode.NON_ROTATING_CAMERA_LOCKED -> {
+                        val camHeading = Math.toDegrees(atan2(camForward.x.toDouble(), camForward.z.toDouble())).toFloat()
+                        player.targetRotationY = camHeading
+                    }
+                }
+            } else {
+                val friction = if (player.isGrounded) groundFriction else airFriction
+                player.velocity.x += (-player.velocity.x) * (friction * dt).coerceAtMost(1f)
+                player.velocity.z += (-player.velocity.z) * (friction * dt).coerceAtMost(1f)
+
+                if (settings.characterRotationMode == CharacterRotationMode.NON_ROTATING_CAMERA_LOCKED) {
+                    val camHeading = Math.toDegrees(atan2(camForward.x.toDouble(), camForward.z.toDouble())).toFloat()
+                    player.targetRotationY = camHeading
+                }
+            }
+        }
+    }
+
+    private fun handlePlayerPhysics(dt: Float) {
+        val previousY = player.position.y
+
+        if (!player.isGrounded || player.isDashing) {
+            player.velocity.y += gravity * dt
+        }
+
+        player.position.x += player.velocity.x * dt
+        player.position.y += player.velocity.y * dt
+        player.position.z += player.velocity.z * dt
+
+        val landing = worldManager.checkPlatformLanding(
+            playerPos = player.position,
+            playerRadius = 0.45f,
+            previousY = previousY,
+            currentY = player.position.y
+        )
+
+        if (landing != null && player.velocity.y <= 0.1f) {
+            player.position.y = landing.surfaceY
+            player.velocity.y = 0f
+            player.isGrounded = true
+
+            if (landing.isBouncePad) {
+                player.velocity.y = landing.bounceForce
+                player.isGrounded = false
+                particleSystem.spawnJumpPuff(player.position, 12)
+                onBouncePad?.invoke()
+            }
+        } else {
+            if (player.isGrounded && player.position.y > 0.1f) {
+                val underLanding = worldManager.checkPlatformLanding(
+                    playerPos = player.position,
+                    playerRadius = 0.45f,
+                    previousY = player.position.y + 0.1f,
+                    currentY = player.position.y - 0.2f
+                )
+                if (underLanding == null) {
+                    player.isGrounded = false
+                }
+            }
+        }
+
+        if (player.position.y < fallRespawnY) {
+            respawnPlayerAtNearestSafePlatform()
+        }
+    }
+
+    private fun executeJump() {
+        if (player.performJump()) {
+            particleSystem.spawnJumpPuff(player.position, 8)
+            onJump?.invoke()
+        }
+    }
+
+    private fun executeDash() {
+        if (player.performDash(camera.forwardXZ)) {
+            particleSystem.spawnJumpPuff(player.position, 10)
+            onDash?.invoke()
+        }
+    }
+
+    private fun executeAttack() {
+        if (player.performAttack()) {
+            val attackRange = 2.6f
+            val rad = Math.toRadians(player.rotationY.toDouble())
+            attackDir.x = sin(rad).toFloat()
+            attackDir.y = 0f
+            attackDir.z = cos(rad).toFloat()
+
+            hitCenter.x = player.position.x + attackDir.x * 1.1f
+            hitCenter.y = player.position.y + 0.8f
+            hitCenter.z = player.position.z + attackDir.z * 1.1f
+
+            val hitTargets = worldManager.findAttackableTargets(hitCenter, attackRange)
+
+            if (hitTargets.isNotEmpty()) {
+                // Requirement 2: Character faces target object on hit
+                var closestTarget: WorldObject? = null
+                var closestDist = Float.MAX_VALUE
+                for (i in hitTargets.indices) {
+                    val t = hitTargets[i]
+                    val d = player.position.distanceTo(t.position)
+                    if (d < closestDist) {
+                        closestDist = d
+                        closestTarget = t
+                    }
+                }
+
+                if (closestTarget != null) {
+                    val dx = closestTarget.position.x - player.position.x
+                    val dz = closestTarget.position.z - player.position.z
+                    val targetHeading = Math.toDegrees(atan2(dx.toDouble(), dz.toDouble())).toFloat()
+                    player.rotationY = targetHeading
+                    player.targetRotationY = targetHeading
+                }
+
+                for (i in hitTargets.indices) {
+                    val target = hitTargets[i]
+                    val isCrit = hitCombo > 2
+                    val damage = if (isCrit) 35f else 25f
+                    val destroyed = target.takeDamage(damage)
+
+                    /* ================= ATTACK HIT SFX + VFX ================= */
+
+                    sparkPos.x = target.position.x
+                    sparkPos.y = target.position.y + target.size.y * 0.4f
+                    sparkPos.z = target.position.z
+
+// Existing particle effect
+                    particleSystem.spawnHitSparks(sparkPos, target.color, 12)
+
+// New attack impact sound and visual effect
+                    GameFeedback.onAttackHit(
+                        sparkPos.x,
+                        sparkPos.y,
+                        sparkPos.z
+                    )
+
+                    /* ================= END ATTACK HIT SFX + VFX ================= */
+
+                    hitCombo++
+                    comboTimer = 2.5f
+                    score += if (isCrit) 50 else 25
+
+                    try {
+                        onHitTarget?.invoke(target, damage, isCrit)
+                    } catch (_: Exception) {}
+
+                    if (destroyed) {
+                        score += 150
+                        particleSystem.spawnBreakExplosion(target.position, target.color, 20)
+                        try {
+                            onObjectDestroyed?.invoke(target)
+                        } catch (_: Exception) {}
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * UI Thread endpoints: Queue requests safely.
+     */
+    fun performJump() {
+        pendingJump = true
+    }
+
+    fun performDash() {
+        pendingDash = true
+    }
+
+    fun performAttack() {
+        pendingAttack = true
+    }
+
+    fun rotateCamera(deltaX: Float, deltaY: Float) {
+        pendingSwipeX += deltaX
+        pendingSwipeY += deltaY
+    }
+
+    fun zoomCamera(delta: Float) {
+        pendingZoom += delta
+    }
+
+    fun respawnPlayerAtNearestSafePlatform() {
+        player.resetTo(Vector3(0f, 1.5f, 0f))
+        camera.distance = settings.defaultZoomDistance
+        camera.yaw = 180f
+        camera.pitch = 22f
+    }
+
+    fun resetGame() {
+        player.resetTo(Vector3(0f, 1.5f, 0f))
+        worldManager.resetAll()
+        particleSystem.clear()
+        camera.distance = settings.defaultZoomDistance
+        camera.yaw = 180f
+        camera.pitch = 22f
+        score = 0
+        hitCombo = 0
+        comboTimer = 0f
+    }
+}
