@@ -10,16 +10,27 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Decode Project Zip
+      - name: Decode or Extract Project Zip
         run: |
-          echo "${{ github.event.client_payload.projectZipBase64 }}" | base64 -d > project.zip
-          unzip -o project.zip
+          if [ -f "workspace/project.zip" ]; then
+            echo "Extracting workspace/project.zip..."
+            unzip -o workspace/project.zip
+          elif [ -n "${{ github.event.client_payload.projectZipBase64 }}" ]; then
+            echo "Decoding projectZipBase64..."
+            echo "${{ github.event.client_payload.projectZipBase64 }}" | base64 -d > project.zip
+            unzip -o project.zip
+          fi
           chmod +x gradlew || true
 
       - name: Build Android APK with Gradle
