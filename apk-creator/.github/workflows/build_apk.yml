@@ -24,12 +24,19 @@ jobs:
       - name: Decode or Extract Project Zip
         run: |
           if [ -f "workspace/project.zip" ]; then
-            echo "Extracting workspace/project.zip..."
+            echo "Found workspace/project.zip in checkout!"
             unzip -o workspace/project.zip
-          elif [ -n "${{ github.event.client_payload.projectZipBase64 }}" ]; then
-            echo "Decoding projectZipBase64..."
-            echo "${{ github.event.client_payload.projectZipBase64 }}" | base64 -d > project.zip
-            unzip -o project.zip
+          else
+            echo "Downloading workspace/project.zip from GitHub..."
+            curl -s -L -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://raw.githubusercontent.com/${{ github.repository }}/main/workspace/project.zip" -o raw_project.zip || true
+            if [ -s "raw_project.zip" ]; then
+              unzip -o raw_project.zip
+            elif [ -n "${{ github.event.client_payload.projectZipBase64 }}" ]; then
+              echo "Decoding projectZipBase64 fallback..."
+              echo "${{ github.event.client_payload.projectZipBase64 }}" | base64 -d > project.zip
+              unzip -o project.zip
+            fi
           fi
           chmod +x gradlew || true
 
